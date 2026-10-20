@@ -1,0 +1,306 @@
+From 8867ecdc6f26c22424c46e22ffc6df36fb499d9f Mon Sep 17 00:00:00 2001
+From: Luciano Dittgen <luciano.dittgen@ossystems.com.br>
+Date: Tue, 20 Oct 2026 14:32:52 -0300
+Subject: [PATCH] fix(raw): only refuse a write overlapping a mounted partition
+
+Writing a bootloader to the gap ahead of the first partition of a disk was
+refused whenever any partition of that disk was mounted, as is always the
+case for the running rootfs:
+
+  target device "/dev/mmcblk1" is in use, it holds the filesystem mounted
+  at "/"
+
+The raw handler now checks only the region it writes, so partitions of a
+whole disk lying outside of it are ignored. The disk itself, its holders,
+overlapping partitions and partitions with unreadable bounds are still
+checked, as is any other target. raw-delta keeps the exclusive check, as
+its written length is not known up front.
+
+Upstream-Status: Submitted [https://github.com/lucianogdittgen/updatehub/tree/fix/raw-region-in-use]
+
+Signed-off-by: Luciano Dittgen <luciano.dittgen@ossystems.com.br>
+---
+ updatehub/src/object/installer/raw.rs | 70 ++++++++++++++------
+ updatehub/src/utils/definitions.rs    | 13 +++-
+ updatehub/src/utils/fs.rs             | 93 ++++++++++++++++++++++++++-
+ 3 files changed, 153 insertions(+), 23 deletions(-)
+
+diff --git a/updatehub/src/object/installer/raw.rs b/updatehub/src/object/installer/raw.rs
+index 6807ea7..18386c1 100644
+--- a/updatehub/src/object/installer/raw.rs
++++ b/updatehub/src/object/installer/raw.rs
+@@ -24,8 +24,11 @@ impl Installer for objects::Raw {
+     async fn check_requirements(&self, _: &Context) -> Result<()> {
+         info!("'raw' handle checking requirements");
+ 
+-        if let definitions::TargetType::Device(dev) =
+-            self.target_type.valid(Access::Exclusive).log_error_msg("device failed vaidation")?
++        let (offset, len) = target_region(self);
++        if let definitions::TargetType::Device(dev) = self
++            .target_type
++            .valid(Access::Region { offset, len })
++            .log_error_msg("device failed vaidation")?
+         {
+             utils::fs::ensure_disk_space(dev, self.required_install_size())
+                 .log_error_msg("not enough disk space")?;
+@@ -43,24 +46,12 @@ impl Installer for objects::Raw {
+         };
+         let source = context.download_dir.join(self.sha256sum());
+         let chunk_size = self.chunk_size.0;
+-        let seek = self.seek * chunk_size as u64;
+         let skip = self.skip.0 * chunk_size as u64;
+         let truncate = self.truncate.0;
+-        let count = match self.count {
+-            definitions::Count::All => None,
+-            definitions::Count::Limited(n) => {
+-                Some(u64::try_from(n).unwrap_or(0) * chunk_size as u64)
+-            }
+-        };
+-
+-        // How much of the target this object writes. The check must stop there,
+-        // otherwise a neighbouring object sharing the device answers for it.
+-        let region_len = if self.compressed {
+-            self.required_uncompressed_size
+-        } else {
+-            let written = self.size.saturating_sub(skip);
+-            count.map_or(written, |n| n.min(written))
+-        };
++        let count = count_bytes(self);
++        // The check must stop at the end of what this object writes, otherwise
++        // a neighbouring object sharing the device answers for it.
++        let (seek, region_len) = target_region(self);
+ 
+         let should_skip_install = super::should_skip_install(
+             self.install_if_different.as_ref(),
+@@ -116,6 +107,28 @@ impl Installer for objects::Raw {
+     }
+ }
+ 
++fn count_bytes(obj: &objects::Raw) -> Option<u64> {
++    match obj.count {
++        definitions::Count::All => None,
++        definitions::Count::Limited(n) => {
++            Some(u64::try_from(n).unwrap_or(0) * obj.chunk_size.0 as u64)
++        }
++    }
++}
++
++/// Offset and length, in bytes, of what `obj` writes to its target.
++fn target_region(obj: &objects::Raw) -> (u64, u64) {
++    let chunk_size = obj.chunk_size.0 as u64;
++    let len = if obj.compressed {
++        obj.required_uncompressed_size
++    } else {
++        let written = obj.size.saturating_sub(obj.skip.0 * chunk_size);
++        count_bytes(obj).map_or(written, |n| n.min(written))
++    };
++
++    (obj.seek * chunk_size, len)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -288,6 +301,27 @@ mod tests {
+         (obj, download_dir, source, dest)
+     }
+ 
++    #[test]
++    fn region_covers_what_is_written() -> Result<()> {
++        let (obj, ..) =
++            fake_raw_object(8192, 1024, 1, 4, definitions::Count::Limited(2), false, false)?;
++        assert_eq!(target_region(&obj), (4096, 2048));
++
++        let (obj, ..) = fake_raw_object(8192, 1024, 1, 4, definitions::Count::All, false, false)?;
++        assert_eq!(target_region(&obj), (4096, 7168));
++
++        let (obj, ..) =
++            fake_raw_object(8192, 1024, 0, 0, definitions::Count::Limited(16), false, false)?;
++        assert_eq!(target_region(&obj), (0, 8192));
++
++        let (mut obj, ..) =
++            fake_raw_object(8192, 1024, 0, 2, definitions::Count::All, false, true)?;
++        obj.required_uncompressed_size = 8192;
++        assert_eq!(target_region(&obj), (2048, 8192));
++
++        Ok(())
++    }
++
+     /// The check must stop at the end of the object it guards. Objects install
+     /// largest first, so the neighbour is already carrying the new version by
+     /// the time this one is checked, and reading into it skips an object that
+diff --git a/updatehub/src/utils/definitions.rs b/updatehub/src/utils/definitions.rs
+index fd7663a..e168651 100644
+--- a/updatehub/src/utils/definitions.rs
++++ b/updatehub/src/utils/definitions.rs
+@@ -15,6 +15,8 @@ use std::path::PathBuf;
+ pub(crate) enum Access {
+     /// The handler writes the device itself, so nothing else may be using it.
+     Exclusive,
++    /// The handler writes only `len` bytes at `offset` of the device.
++    Region { offset: u64, len: u64 },
+     /// The handler writes through a filesystem it mounts, which is safe to do
+     /// even on a device already mounted elsewhere.
+     ThroughFilesystem,
+@@ -32,7 +34,8 @@ impl Access {
+ pub(crate) trait TargetTypeExt {
+     /// Checks whether the device is valid to start installation, i.e.,
+     /// device exists, use have write permission, and is free of mounted
+-    /// filesystems when the handler asks for [`Access::Exclusive`].
++    /// filesystems when the handler asks for [`Access::Exclusive`] or
++    /// [`Access::Region`].
+     fn valid(&self, access: Access) -> Result<&Self>;
+ 
+     /// Gets device's path for mounting.
+@@ -51,8 +54,12 @@ impl TargetTypeExt for TargetType {
+             return Err(Error::MissingWritePermission(device));
+         }
+ 
+-        if let Access::Exclusive = access {
+-            fs::ensure_not_mounted(&device)?;
++        match access {
++            Access::Exclusive => fs::ensure_not_mounted(&device)?,
++            Access::Region { offset, len } => {
++                fs::ensure_region_not_mounted(&device, offset..offset.saturating_add(len))?;
++            }
++            Access::ThroughFilesystem => {}
+         }
+ 
+         Ok(self)
+diff --git a/updatehub/src/utils/fs.rs b/updatehub/src/utils/fs.rs
+index a76daf8..0d8157f 100644
+--- a/updatehub/src/utils/fs.rs
++++ b/updatehub/src/utils/fs.rs
+@@ -12,6 +12,7 @@ use slog_scope::trace;
+ use std::{
+     collections::HashSet,
+     io::{self, Seek},
++    ops::Range,
+     os::unix::fs::FileTypeExt,
+     path::{Path, PathBuf},
+ };
+@@ -74,6 +75,21 @@ type DeviceId = (u64, u64);
+ pub(crate) fn ensure_not_mounted(target: &Path) -> Result<()> {
+     trace!("checking whether {:?} is in use", target);
+ 
++    ensure_devices_not_mounted(target, related_block_devices)
++}
++
++/// Like [`ensure_not_mounted`], but ignores the partitions of a whole disk
++/// lying outside `region`.
++pub(crate) fn ensure_region_not_mounted(target: &Path, region: Range<u64>) -> Result<()> {
++    trace!("checking whether {:?} is in use within {:?}", target, region);
++
++    ensure_devices_not_mounted(target, |device| region_block_devices(device, &region))
++}
++
++fn ensure_devices_not_mounted(
++    target: &Path,
++    related: impl Fn(DeviceId) -> HashSet<DeviceId>,
++) -> Result<()> {
+     let metadata = match std::fs::metadata(target) {
+         Ok(metadata) => metadata,
+         // Nothing can be mounted on a device which is not there. Complaining
+@@ -87,10 +103,10 @@ pub(crate) fn ensure_not_mounted(target: &Path) -> Result<()> {
+     let sources = mtd::mount_sources_for(target).into_iter().collect::<HashSet<_>>();
+ 
+     let mut devices = HashSet::new();
+-    devices.extend(block_device_id(&metadata).into_iter().flat_map(related_block_devices));
++    devices.extend(block_device_id(&metadata).into_iter().flat_map(&related));
+     for source in sources.iter().filter(|source| source.starts_with('/')) {
+         if let Ok(metadata) = std::fs::metadata(source) {
+-            devices.extend(block_device_id(&metadata).into_iter().flat_map(related_block_devices));
++            devices.extend(block_device_id(&metadata).into_iter().flat_map(&related));
+         }
+     }
+ 
+@@ -180,6 +196,47 @@ fn related_block_devices(device: DeviceId) -> HashSet<DeviceId> {
+     found
+ }
+ 
++/// Like [`related_block_devices`], without the partitions lying outside
++/// `region`.
++fn region_block_devices(device: DeviceId, region: &Range<u64>) -> HashSet<DeviceId> {
++    let sysfs = PathBuf::from(format!("/sys/dev/block/{}:{}", device.0, device.1));
++    let Some(sysfs) = sysfs.canonicalize().ok().filter(|sysfs| !sysfs.join("partition").exists())
++    else {
++        return related_block_devices(device);
++    };
++
++    let mut found = HashSet::from([device]);
++    found.extend(
++        device_ids_in(&sysfs.join("holders"), |_| true).into_iter().flat_map(related_block_devices),
++    );
++    // Unreadable bounds count as overlapping.
++    found.extend(
++        device_ids_in(&sysfs, |path| {
++            path.join("partition").exists()
++                && partition_range(path).is_none_or(|partition| overlaps(&partition, region))
++        })
++        .into_iter()
++        .flat_map(related_block_devices),
++    );
++
++    found
++}
++
++/// sysfs reports `start` and `size` in 512 byte sectors.
++fn partition_range(path: &Path) -> Option<Range<u64>> {
++    let sectors = |name: &str| -> Option<u64> {
++        std::fs::read_to_string(path.join(name)).ok()?.trim().parse().ok()
++    };
++    let start = sectors("start")?.checked_mul(512)?;
++    let end = start.checked_add(sectors("size")?.checked_mul(512)?)?;
++
++    Some(start..end)
++}
++
++fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
++    a.start.max(b.start) < a.end.min(b.end)
++}
++
+ /// Device numbers of the sysfs entries under `dir` which satisfy `wanted`.
+ fn device_ids_in(dir: &Path, wanted: impl Fn(&Path) -> bool) -> Vec<DeviceId> {
+     let Ok(entries) = std::fs::read_dir(dir) else {
+@@ -514,6 +571,38 @@ mod tests {
+         assert!(parse_mount_entry("26 25 bogus / /boot rw - ext4 /dev/sda2 rw").is_none());
+     }
+ 
++    #[test]
++    fn regions_overlap_only_when_sharing_a_byte() {
++        let rootfs = 0x10_0000..0x6a50_0000;
++        assert!(!overlaps(&(0x2_0000..0x3_415c), &rootfs));
++        assert!(!overlaps(&(0x6_0000..0xc_2f48), &rootfs));
++
++        assert!(!overlaps(&(0x8_0000..0x10_0000), &rootfs));
++        assert!(overlaps(&(0x8_0000..0x10_0001), &rootfs));
++        assert!(overlaps(&(0x20_0000..0x30_0000), &rootfs));
++        assert!(overlaps(&(0..u64::MAX), &rootfs));
++        assert!(!overlaps(&(0x20_0000..0x20_0000), &rootfs));
++    }
++
++    #[test]
++    fn partition_range_is_read_in_sectors() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("start"), "2048\n").unwrap();
++        std::fs::write(dir.path().join("size"), "3481600\n").unwrap();
++
++        assert_eq!(partition_range(dir.path()), Some(0x10_0000..0x6a50_0000));
++    }
++
++    #[test]
++    fn partition_range_needs_both_bounds() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("start"), "2048\n").unwrap();
++        assert_eq!(partition_range(dir.path()), None);
++
++        std::fs::write(dir.path().join("size"), "bogus\n").unwrap();
++        assert_eq!(partition_range(dir.path()), None);
++    }
++
+     #[test]
+     fn regular_file_is_not_in_use() {
+         let file = tempfile::NamedTempFile::new().unwrap();
+-- 
+2.54.0
+
