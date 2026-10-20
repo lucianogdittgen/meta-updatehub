@@ -13,7 +13,7 @@ The write now stops at the checked region and fails the install when the
 data goes past it. A compressed object not declaring its uncompressed size
 has no known region, so it keeps the exclusive check and is not bounded.
 
-Upstream-Status: Submitted [https://github.com/lucianogdittgen/updatehub/tree/fix/raw-region-in-use]
+Upstream-Status: Submitted [https://github.com/UpdateHub/updatehub/pull/460]
 
 Signed-off-by: Luciano Dittgen <luciano.dittgen@ossystems.com.br>
 ---
