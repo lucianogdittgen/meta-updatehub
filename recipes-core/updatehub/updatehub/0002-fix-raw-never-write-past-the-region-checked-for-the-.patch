@@ -1,0 +1,196 @@
+From 25b518037c6c4a59493258d9bed81fdb569c90b7 Mon Sep 17 00:00:00 2001
+From: Luciano Dittgen <luciano.dittgen@ossystems.com.br>
+Date: Tue, 20 Oct 2026 15:47:29 -0300
+Subject: [PATCH] fix(raw): never write past the region checked for the object
+
+The in-use check covers the region an object declares, from its size or,
+when compressed, its required-uncompressed-size, but the write itself went
+on for as long as the source or the decompressor produced data. Metadata
+understating the data let the write run into a partition the check had
+left out.
+
+The write now stops at the checked region and fails the install when the
+data goes past it. A compressed object not declaring its uncompressed size
+has no known region, so it keeps the exclusive check and is not bounded.
+
+Upstream-Status: Submitted [https://github.com/lucianogdittgen/updatehub/tree/fix/raw-region-in-use]
+
+Signed-off-by: Luciano Dittgen <luciano.dittgen@ossystems.com.br>
+---
+ updatehub/src/object/installer/raw.rs | 49 +++++++++++++++---
+ updatehub/src/utils/io.rs             | 74 ++++++++++++++++++++++++++-
+ 2 files changed, 116 insertions(+), 7 deletions(-)
+
+diff --git a/updatehub/src/object/installer/raw.rs b/updatehub/src/object/installer/raw.rs
+index 18386c1..815e596 100644
+--- a/updatehub/src/object/installer/raw.rs
++++ b/updatehub/src/object/installer/raw.rs
+@@ -24,11 +24,10 @@ impl Installer for objects::Raw {
+     async fn check_requirements(&self, _: &Context) -> Result<()> {
+         info!("'raw' handle checking requirements");
+ 
+-        let (offset, len) = target_region(self);
+-        if let definitions::TargetType::Device(dev) = self
+-            .target_type
+-            .valid(Access::Region { offset, len })
+-            .log_error_msg("device failed vaidation")?
++        let access = checked_region(self)
++            .map_or(Access::Exclusive, |(offset, len)| Access::Region { offset, len });
++        if let definitions::TargetType::Device(dev) =
++            self.target_type.valid(access).log_error_msg("device failed vaidation")?
+         {
+             utils::fs::ensure_disk_space(dev, self.required_install_size())
+                 .log_error_msg("not enough disk space")?;
+@@ -90,7 +89,8 @@ impl Installer for objects::Raw {
+                     .log_error_msg("failed to open target file")?,
+             );
+             target.seek(SeekFrom::Start(seek)).await.log_error_msg("failed to seek target file")?;
+-            target
++            let limit = checked_region(self).map_or(u64::MAX, |(_, len)| len);
++            utils::io::BoundedWriter::new(target, limit)
+         };
+ 
+         if self.compressed {
+@@ -129,6 +129,12 @@ fn target_region(obj: &objects::Raw) -> (u64, u64) {
+     (obj.seek * chunk_size, len)
+ }
+ 
++/// The region requirements are checked for, when it is known up front. A
++/// compressed object not declaring its uncompressed size is not.
++fn checked_region(obj: &objects::Raw) -> Option<(u64, u64)> {
++    (!obj.compressed || obj.required_uncompressed_size != 0).then(|| target_region(obj))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -322,6 +328,37 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn compressed_object_without_its_size_has_no_checked_region() -> Result<()> {
++        let (mut obj, ..) =
++            fake_raw_object(8192, 1024, 0, 2, definitions::Count::All, false, true)?;
++        assert_eq!(checked_region(&obj), None);
++
++        obj.required_uncompressed_size = 8192;
++        assert_eq!(checked_region(&obj), Some((2048, 8192)));
++
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn source_longer_than_declared_is_not_written_past_its_region() {
++        let size = 2048;
++        let chunk_size = 8;
++        let (mut obj, download_dir, _source_guard, target_guard, _) =
++            fake_raw_object(size, chunk_size, 0, 0, definitions::Count::All, false, false).unwrap();
++        // The metadata claims less than the source holds.
++        obj.size = 1024;
++        let context =
++            Context { download_dir: download_dir.path().to_owned(), ..Context::default() };
++
++        let res = obj.install(&context).await;
++        assert!(res.is_err(), "a source longer than declared must fail the install");
++
++        let target = std::fs::read(target_guard.path()).unwrap();
++        assert!(target[..1024].iter().all(|b| *b == ORIGINAL_BYTE));
++        assert!(target[1024..].iter().all(|b| *b == DEFAULT_BYTE));
++    }
++
+     /// The check must stop at the end of the object it guards. Objects install
+     /// largest first, so the neighbour is already carrying the new version by
+     /// the time this one is checked, and reading into it skips an object that
+diff --git a/updatehub/src/utils/io.rs b/updatehub/src/utils/io.rs
+index e7670e1..cc10e61 100644
+--- a/updatehub/src/utils/io.rs
++++ b/updatehub/src/utils/io.rs
+@@ -3,7 +3,12 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use slog_scope::trace;
+-use std::{pin::Pin, time::Duration};
++use std::{
++    io,
++    pin::Pin,
++    task::{Context, Poll, ready},
++    time::Duration,
++};
+ use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
+ use tokio_io_timeout::{TimeoutReader, TimeoutWriter};
+ 
+@@ -32,3 +37,70 @@ where
+     w.set_timeout(Some(Duration::from_secs(5)));
+     Box::pin(BufWriter::with_capacity(chunk_size, w))
+ }
++
++/// Fails a write going past `limit` bytes, so an object cannot reach beyond
++/// the region its requirements were checked for.
++pub(crate) struct BoundedWriter<W> {
++    inner: W,
++    remaining: u64,
++}
++
++impl<W> BoundedWriter<W> {
++    pub(crate) fn new(inner: W, limit: u64) -> Self {
++        BoundedWriter { inner, remaining: limit }
++    }
++}
++
++impl<W: AsyncWrite + Unpin> AsyncWrite for BoundedWriter<W> {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        if self.remaining == 0 && !buf.is_empty() {
++            return Poll::Ready(Err(io::Error::other(
++                "data goes past the region checked for the object",
++            )));
++        }
++
++        let len = buf.len().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
++        let written = ready!(Pin::new(&mut self.inner).poll_write(cx, &buf[..len]))?;
++        self.remaining -= written as u64;
++
++        Poll::Ready(Ok(written))
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.inner).poll_shutdown(cx)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::io::AsyncWriteExt;
++
++    #[tokio::test]
++    async fn bounded_writer_takes_up_to_its_limit() {
++        let mut out = Vec::new();
++        let mut w = BoundedWriter::new(&mut out, 4);
++        w.write_all(b"abcd").await.unwrap();
++        w.flush().await.unwrap();
++
++        assert_eq!(out, b"abcd");
++    }
++
++    #[tokio::test]
++    async fn bounded_writer_refuses_what_goes_past_its_limit() {
++        let mut out = Vec::new();
++        let mut w = BoundedWriter::new(&mut out, 4);
++        let res = w.write_all(b"abcdef").await;
++
++        assert!(res.is_err(), "writing past the limit must fail");
++        assert_eq!(out, b"abcd");
++    }
++}
+-- 
+2.54.0
+

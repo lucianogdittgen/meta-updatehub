@@ -14,6 +14,7 @@ SRC_URI += " \
     file://updatehub.initd \
     file://updatehub.service \
     file://0001-fix-raw-only-refuse-a-write-overlapping-a-mounted-pa.patch \
+    file://0002-fix-raw-never-write-past-the-region-checked-for-the-.patch \
 "
 
 SRCREV = "d6b23ae49334cfb03c6704f52853ac9906e869bf"
